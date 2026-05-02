@@ -1,0 +1,103 @@
+name: Auto Approve PRs
+
+# Triggers after the Enterprise Pipeline completes on a PR.
+# Uses the meshlogic-ci-dependency-access GitHub App to approve,
+# since the app is a distinct identity from the PR author.
+on:
+  workflow_run:
+    workflows: ["Go SDK", "Python SDK", "TypeScript SDK"]
+    types: [completed]
+
+# Only one auto-approve per PR at a time — prevents cascade pile-up
+concurrency:
+  group: auto-approve-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  auto-approve:
+    name: Auto Approve (CI Passed)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.event.workflow_run.repository.full_name
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: MeshLogic-Pty-Ltd
+
+      - name: Find and approve PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const run = context.payload.workflow_run;
+            const prs = run.pull_requests;
+
+            if (!prs || prs.length === 0) {
+              console.log('No PRs associated with this workflow run');
+              return;
+            }
+
+            const prNumber = prs[0].number;
+
+            // Security: verify PR author is an org member (blocks fork PR attacks)
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const author = pr.user.login;
+            // Verify author has write+ access to this repo (covers org members and collaborators).
+            // Uses repos scope (already granted) instead of org:members:read.
+            try {
+              const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: author,
+              });
+              const allowed = ['admin', 'maintain', 'write'];
+              if (!allowed.includes(perm.permission)) {
+                console.log(`PR #${prNumber} author ${author} has '${perm.permission}' permission — skipping auto-approve`);
+                return;
+              }
+            } catch (e) {
+              const status = e.status || 'unknown';
+              const message = e.message || 'no details';
+              console.log(`PR #${prNumber} — collaborator check failed for ${author} (HTTP ${status}: ${message}). Skipping auto-approve.`);
+              return;
+            }
+
+            console.log(`Approving PR #${prNumber} by org member ${author} after successful CI`);
+
+            // Check if already approved by this specific bot
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const appApproval = reviews.find(
+              r => r.state === 'APPROVED' &&
+                   r.user.login === 'meshlogic-ci-dependency-access[bot]'
+            );
+
+            if (appApproval) {
+              console.log('PR already approved by meshlogic-ci-dependency-access — skipping');
+              return;
+            }
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: 'APPROVE',
+              body: 'All CI checks passed. Auto-approved by meshlogic-ci-dependency-access.',
+            });
+
+            console.log(`PR #${prNumber} approved`);
