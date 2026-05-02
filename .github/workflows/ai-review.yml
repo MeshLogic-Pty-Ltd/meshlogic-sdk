@@ -53,8 +53,9 @@ jobs:
     # Mutable @v1 = supply-chain risk if the tag is repointed. SHA = immutable.
     uses: MeshLogic-Pty-Ltd/meshlogic-agent/.github/workflows/ai-review.yml@f0549a36936809a6320ad438d79a3a4d33092457
     secrets: inherit
-    permissions:
-      pull-requests: write
-      contents: read
-      statuses: write
-      issues: read
+    # NOTE: GitHub does NOT honor a job-level `permissions:` block on
+    # a `uses:` (reusable-workflow) job — the called workflow declares
+    # its own permissions. The top-level `permissions: {}` above is
+    # the correct caller-side hardening (default-deny). The reusable
+    # workflow grants exactly what it needs at its own job level.
+    # See AI Review on PR #27 (v3 review MED#1) for context.

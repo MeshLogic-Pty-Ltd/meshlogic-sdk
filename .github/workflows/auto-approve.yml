@@ -11,7 +11,7 @@ name: Auto Approve PRs
 # auto-approve will silently stop firing. Keep this list in sync
 # with branch protection's required-checks list.
 #
-# SECURITY MODEL (v3 — incorporates AI Review findings on #934 + #937):
+# SECURITY MODEL (v4 — incorporates AI Review findings on #934, #937, and v3 of consumer rollout):
 #
 #   1. Approves only the exact SHA that CI validated (HIGH#1):
 #      verifies pr.head.sha === workflow_run.head_sha. Prevents
@@ -74,26 +74,20 @@ jobs:
             const run = context.payload.workflow_run;
             const prs = run.pull_requests;
 
-            if (!prs || prs.length === 0) {
-              console.log('No PRs associated with this workflow run');
-              return;
-            }
-
-            // v2 review LOW#1: iterate over every PR rather than
-            // unconditionally indexing prs[0]. In practice
-            // workflow_run.pull_requests is almost always length 1
-            // (and only populated for same-repo PRs), but a commit
-            // attached to multiple PRs would otherwise be silently
-            // half-approved.
-            for (const prRef of prs) {
-              try {
-                await processPullRequest(prRef.number);
-              } catch (e) {
-                console.log(`PR #${prRef.number}: unexpected error during auto-approve evaluation — ${e.message}. Skipping.`);
-              }
-            }
-
-            async function processPullRequest(prNumber) {
+            // v2 LOW#1 + v3 MED#5: helper declared as const arrow
+            // before the call site, with `run` passed explicitly.
+            // Function declarations would hoist but the resulting
+            // dependency on enclosing-scope state is fragile under
+            // changes to the actions/github-script wrapper.
+            //
+            // v3 review note on forks: workflow_run.pull_requests is
+            // ONLY populated for same-repo PRs by design. The job-
+            // level `if:` already requires head_repository ==
+            // repository for additional safety. Fork PRs never reach
+            // this code; that's intentional — forks must always go
+            // through human review. This is documented to prevent
+            // a future maintainer from "fixing" the silent skip.
+            const processPullRequest = async (prNumber, run) => {
 
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -148,14 +142,19 @@ jobs:
               return;
             }
 
-            // LOW#6: extended sensitive-path skip. Paginated to catch
-            // sensitive files past the first 30 in large PRs.
+            // LOW#6 + v3 review MED#6: extended sensitive-path skip.
+            // Paginated to catch sensitive files past the first 30
+            // in large PRs.
             const SENSITIVE_PATTERNS = [
               // CI / review / governance config
               /^\.github\/workflows\//,
               /^\.github\/actions\//,
               /^\.github\/dependabot\.ya?ml$/,
+              /^\.github\/renovate\.json5?$/,
               /^\.github\/CODEOWNERS$/,
+              /^\.github\/[^\/]+\.ya?ml$/,    // root .github/*.yml (auto-merge, label config, etc.)
+              // Submodule pointer changes (supply-chain attack vector)
+              /^\.gitmodules$/,
               // Policy as code
               /^policy\//,
               // Dependency manifests (supply-chain vector)
@@ -167,11 +166,16 @@ jobs:
               /^(requirements[^/]*\.txt|Pipfile(\.lock)?|pyproject\.toml|poetry\.lock|uv\.lock)$/,
               /^Gemfile(\.lock)?$/,
               /^composer\.(json|lock)$/,
+              /^flake\.(nix|lock)$/,
+              // Container image manifests
+              /(^|\/)Dockerfile[^\/]*$/,
+              /^docker-compose[^\/]*\.ya?ml$/,
+              /^\.dockerignore$/,
               // Build / release scripts
               /^scripts\//,
               /^Makefile$/,
               // Signing material / secrets config
-              /(^|\/)(signing|certs?|secrets?|keys?)\//,
+              /(^|\/)(signing|certs?|secrets?|keys?)(\/|\.)/,
               /\.(pem|key|p12|pfx|cer|crt)$/,
             ];
 
@@ -206,6 +210,7 @@ jobs:
             // (v2 review MED#3): a repo migrated to rulesets may have
             // an empty contexts list and only populate checks[].
             let requiredChecks = [];
+            let bpUnreadable = false;
             try {
               const { data: protection } = await github.rest.repos.getBranchProtection({
                 owner: context.repo.owner,
@@ -217,27 +222,32 @@ jobs:
               const modern = (rsc?.checks ?? []).map(c => c.context);
               requiredChecks = [...new Set([...legacy, ...modern])];
             } catch (e) {
-              // 404 = no branch protection on base; proceed with fallback gate
-              if (e.status !== 404) {
+              // v3 review MED#3: distinguish "no protection" from
+              // "missing administration:read permission". Both surface
+              // as 404 from the REST API; a configured-but-unreadable
+              // case must NOT silently degrade to the fallback gate.
+              if (e.status === 404 || e.status === 403) {
+                bpUnreadable = true;
+                console.log(`Branch-protection lookup returned ${e.status} on ${pr.base.ref}: ${e.message}. Treating as unprotected — fallback gate (triggering workflow + AI Review) will apply.`);
+              } else {
                 console.log(`Branch-protection lookup failed (HTTP ${e.status}): ${e.message}. Skipping auto-approve out of caution.`);
                 return;
               }
             }
 
-            // Fallback gate: if no required checks configured, the
-            // triggering workflow AND AI Review Findings must both be
-            // success. v2 review HIGH#1: AI Review is posted as a
-            // *check-run* (not a legacy commit status), so looking it
-            // up in combined.statuses returned nothing and the check
-            // was silently dropped — letting auto-approve fire while
-            // AI Review was pending or had flagged BLOCKING/HIGH.
-            // We now ALWAYS require AI Review in fallback mode and
-            // resolve it later from the merged check-runs+statuses
-            // map. Repos that genuinely don't have AI Review installed
-            // will fail closed (no auto-approve) rather than fail open.
+            // v3 review HIGH#1: AI Review enforcement was previously
+            // only added in the fallback (no-branch-protection) path.
+            // For repos that DO have branch protection but don't list
+            // AI Review as required, auto-approve would happily fire
+            // while AI Review had flagged BLOCKING/HIGH findings. AI
+            // Review is the security gate of last resort — require
+            // it unconditionally. If a repo legitimately doesn't have
+            // AI Review installed, this gate fails closed (the check
+            // is "missing" → auto-approve skips → human review needed).
             if (requiredChecks.length === 0) {
-              requiredChecks = [run.name, 'AI Review Findings'];
+              requiredChecks = [run.name];
             }
+            requiredChecks = [...new Set([...requiredChecks, 'AI Review Findings'])];
 
             // Fetch all check-runs + statuses on the validated SHA.
             const checkRuns = await github.paginate(github.rest.checks.listForRef, {
@@ -261,14 +271,18 @@ jobs:
               checkOutcomes.set(s.context, s.state); // success | failure | error | pending
             }
 
-            // v2 review LOW#2: drop 'skipped' from the accepted set.
-            // GitHub treats skipped as not-passing for required
-            // checks; an attacker who can cause a required check to
-            // be skipped (e.g. via path filters) shouldn't get a free
-            // auto-approve. 'neutral' is retained because GitHub's
-            // own branch-protection semantics treat it as passing for
-            // check-runs that opt into it.
-            const PASSING = new Set(['success', 'neutral']);
+            // v2 review LOW#2 + v3 review HIGH#2: only 'success' is
+            // accepted as passing. We previously also accepted
+            // 'neutral' (per GitHub's branch-protection semantics),
+            // but for security-sensitive gates like AI Review,
+            // 'neutral' often means the gate degraded (rate-limit,
+            // missing API key, partial failure). Accepting it
+            // creates a fail-open path. 'skipped' is dropped for the
+            // same reason — an attacker who causes a path-filtered
+            // required check to skip should not bypass approval.
+            // 'error' and 'pending' are non-terminal/error states
+            // and never accepted as passing.
+            const PASSING = new Set(['success']);
             const failing = [];
             const missing = [];
             for (const required of requiredChecks) {
@@ -318,4 +332,17 @@ jobs:
 
             console.log(`PR #${prNumber} approved at SHA ${run.head_sha.slice(0,7)}`);
 
-            }  // end processPullRequest
+            };  // end processPullRequest
+
+            if (!prs || prs.length === 0) {
+              console.log('No PRs associated with this workflow run');
+              return;
+            }
+
+            for (const prRef of prs) {
+              try {
+                await processPullRequest(prRef.number, run);
+              } catch (e) {
+                console.log(`PR #${prRef.number}: unexpected error during auto-approve evaluation — ${e.message}. Skipping.`);
+              }
+            }
