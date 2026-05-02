@@ -1,8 +1,14 @@
 name: Auto Approve PRs
 
-# Triggers after the Enterprise Pipeline completes on a PR.
+# Triggers after the gating CI workflow(s) complete on a PR.
 # Uses the meshlogic-ci-dependency-access GitHub App to approve,
 # since the app is a distinct identity from the PR author.
+#
+# SECURITY: skips PRs that touch sensitive paths (workflows + policy).
+# Those changes must be approved by a human, not the bot — otherwise a
+# write-perm contributor could self-merge .github/workflows/ changes
+# (re-introducing the supply-chain risk that the SHA pin in
+# ai-review.yml exists to prevent).
 on:
   workflow_run:
     workflows: ["Go SDK", "Python SDK", "TypeScript SDK"]
@@ -70,6 +76,36 @@ jobs:
               const status = e.status || 'unknown';
               const message = e.message || 'no details';
               console.log(`PR #${prNumber} — collaborator check failed for ${author} (HTTP ${status}: ${message}). Skipping auto-approve.`);
+              return;
+            }
+
+            // SECURITY: paginate listFiles and skip auto-approve on PRs that
+            // touch sensitive paths. Without paginate, large PRs (>30 files)
+            // would silently miss sensitive files past page 1, allowing the
+            // bot to approve workflow changes hidden in big diffs.
+            const SENSITIVE_PATTERNS = [
+              /^\.github\/workflows\//,         // any CI / review workflow
+              /^\.github\/dependabot\.ya?ml$/,  // dependency update config
+              /^\.github\/CODEOWNERS$/,         // review-routing rules
+              /^policy\//,                       // OPA / Rego policies
+            ];
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const sensitiveFiles = files
+              .map(f => f.filename)
+              .filter(name => SENSITIVE_PATTERNS.some(p => p.test(name)));
+
+            if (sensitiveFiles.length > 0) {
+              const sample = sensitiveFiles.slice(0, 5).join(', ');
+              const more = sensitiveFiles.length > 5 ? ` (+${sensitiveFiles.length - 5} more)` : '';
+              console.log(`PR #${prNumber} touches sensitive paths — skipping auto-approve. Files: ${sample}${more}`);
+              console.log('Sensitive-path changes require explicit human approval to prevent self-merge of CI / policy / review-routing config.');
               return;
             }
 
