@@ -1,6 +1,6 @@
 name: Auto Approve PRs
 
-# auto-approve.yml | version: v6 | last reviewed: 2026-05-03
+# auto-approve.yml | version: v7 | last reviewed: 2026-05-03
 #
 # Operator audit one-liner:
 #   gh api /repos/<owner>/<repo>/contents/.github/workflows/auto-approve.yml \
@@ -18,7 +18,7 @@ name: Auto Approve PRs
 # auto-approve will silently stop firing. Keep this list in sync
 # with branch protection's required-checks list.
 #
-# SECURITY MODEL (v6 — robust bpUnreadable gate via hadProtectionSignal flag; case-insensitive .github/*.yml matching):
+# SECURITY MODEL (v7 — bpUnreadable now correctly differentiates 404 (fallback OK) from 403 (privilege regression, hard fail)):
 #
 #   1. Approves only the exact SHA that CI validated (HIGH#1):
 #      verifies pr.head.sha === workflow_run.head_sha. Prevents
@@ -248,38 +248,30 @@ jobs:
               requiredChecks = [...new Set([...legacy, ...modern])];
               hadProtectionSignal = true;
             } catch (e) {
-              // v3 review MED#3: distinguish "no protection" from
-              // "missing administration:read permission". Both surface
-              // as 404 from the REST API; a configured-but-unreadable
-              // case must NOT silently degrade to the fallback gate.
-              if (e.status === 404 || e.status === 403) {
+              // v3 review MED#3 + v4 / v5 / v6 review recurring HIGH:
+              // 404 and 403 mean different things and MUST be handled
+              // differently:
+              //   - 404 = no branch protection on this branch. The
+              //     operator chose this state. Fallback gate (CI +
+              //     AI Review) is the deliberate contract.
+              //   - 403 = branch protection EXISTS but the App lost
+              //     administration:read. This is a privilege
+              //     regression. We have no idea what BP requires; we
+              //     cannot enforce it. HARD FAIL — refuse to approve.
+              //
+              // Earlier iterations conflated the two and the gate
+              // silently degraded. v7 fixes this once and for all.
+              if (e.status === 403) {
+                console.log(`Branch-protection lookup forbidden (403) on ${pr.base.ref}: ${e.message}. App may have lost administration:read; refusing to auto-approve.`);
+                return;
+              }
+              if (e.status === 404) {
                 bpUnreadable = true;
-                console.log(`Branch-protection lookup returned ${e.status} on ${pr.base.ref}: ${e.message}. Treating as unprotected — fallback gate (triggering workflow + AI Review) will apply unless this is the protected-but-unreadable case.`);
+                console.log(`No branch protection on ${pr.base.ref} (404). Fallback gate (triggering workflow + AI Review) will apply.`);
               } else {
                 console.log(`Branch-protection lookup failed (HTTP ${e.status}): ${e.message}. Skipping auto-approve out of caution.`);
                 return;
               }
-            }
-
-            // v4 review HIGH#1 + v5 review HIGH#2: refuse to approve
-            // when BP could not be read AND we have no other signal.
-            // bpUnreadable is true for both 404 (no protection at all)
-            // and 403 (protection exists but App lacks
-            // administration:read). The 404 case is fine — fallback
-            // applies. The 403 case must NOT silently degrade.
-            // We can't distinguish the two from the API response, so
-            // err on the side of caution: if we got NO protection
-            // signal at all, only proceed via the deliberate fallback
-            // (which still requires CI workflow + AI Review). The
-            // operator who has explicitly granted no protection on
-            // this branch is opting into the fallback contract.
-            //
-            // Note: hadProtectionSignal is the source of truth, NOT
-            // requiredChecks.length — that gets mutated below.
-            if (bpUnreadable && !hadProtectionSignal) {
-              // documented fall-through to fallback gate; the gate
-              // itself enforces strict CI + AI Review success.
-              console.log(`Proceeding to fallback gate for ${pr.base.ref}: triggering workflow ${run.name} + AI Review must both be success.`);
             }
 
             // v3 review HIGH#1: AI Review enforcement was previously
