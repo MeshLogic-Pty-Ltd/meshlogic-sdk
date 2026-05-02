@@ -53,9 +53,22 @@ jobs:
     # Mutable @v1 = supply-chain risk if the tag is repointed. SHA = immutable.
     uses: MeshLogic-Pty-Ltd/meshlogic-agent/.github/workflows/ai-review.yml@f0549a36936809a6320ad438d79a3a4d33092457
     secrets: inherit
-    # NOTE: GitHub does NOT honor a job-level `permissions:` block on
-    # a `uses:` (reusable-workflow) job — the called workflow declares
-    # its own permissions. The top-level `permissions: {}` above is
-    # the correct caller-side hardening (default-deny). The reusable
-    # workflow grants exactly what it needs at its own job level.
-    # See AI Review on PR #27 (v3 review MED#1) for context.
+    # IMPORTANT: do NOT remove this permissions block.
+    #
+    # The v3 AI Review on PR #27 advised that `permissions:` on a
+    # `uses:` job is dead config. That advice was WRONG and v4
+    # initially followed it — which caused startup_failure on the
+    # AI Review workflow run on PR #937 (no permissions to post the
+    # review comment / set the status check).
+    #
+    # Per GitHub Actions docs: when the workflow-level `permissions:`
+    # is restrictive (here, `permissions: {}` = default-deny), the
+    # caller MUST grant the called workflow's needed permissions on
+    # the calling job. These are the MAXIMUM allowed permissions for
+    # the reusable workflow's GITHUB_TOKEN; the called workflow can
+    # request less but cannot exceed.
+    permissions:
+      pull-requests: write    # post review comment
+      contents: read          # checkout PR diff
+      statuses: write         # post AI Review Findings status check
+      issues: read            # read issue_comment payload (override)
