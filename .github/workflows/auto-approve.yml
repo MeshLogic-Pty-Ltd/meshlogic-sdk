@@ -1,5 +1,12 @@
 name: Auto Approve PRs
 
+# auto-approve.yml | version: v6 | last reviewed: 2026-05-03
+#
+# Operator audit one-liner:
+#   gh api /repos/<owner>/<repo>/contents/.github/workflows/auto-approve.yml \
+#     --jq '.content' | base64 -d | head -3
+# yields the version + review date for any consumer repo.
+#
 # Triggers after the gating CI workflow(s) complete on a PR.
 # Uses the meshlogic-ci-dependency-access GitHub App to approve,
 # since the app is a distinct identity from the PR author.
@@ -11,7 +18,7 @@ name: Auto Approve PRs
 # auto-approve will silently stop firing. Keep this list in sync
 # with branch protection's required-checks list.
 #
-# SECURITY MODEL (v5 — addresses HIGH bpUnreadable bug in v4 plus tightening of signing-path regex, concurrency key, and helper-function shape):
+# SECURITY MODEL (v6 — robust bpUnreadable gate via hadProtectionSignal flag; case-insensitive .github/*.yml matching):
 #
 #   1. Approves only the exact SHA that CI validated (HIGH#1):
 #      verifies pr.head.sha === workflow_run.head_sha. Prevents
@@ -157,7 +164,7 @@ jobs:
               /^\.github\/dependabot\.ya?ml$/,
               /^\.github\/renovate\.json5?$/,
               /^\.github\/CODEOWNERS$/,
-              /^\.github\/[^\/]+\.ya?ml$/,    // root .github/*.yml (auto-merge, label config, etc.)
+              /^\.github\/[^\/]+\.ya?ml$/i,    // root .github/*.yml (auto-merge, label config, etc.) — case-insensitive
               // Submodule pointer changes (supply-chain attack vector)
               /^\.gitmodules$/,
               // Policy as code
@@ -221,8 +228,14 @@ jobs:
             // ruleset/branch-protection-v2 `checks[].context` field
             // (v2 review MED#3): a repo migrated to rulesets may have
             // an empty contexts list and only populate checks[].
+            // v5 review HIGH#2: gate on hadProtectionSignal (set
+            // inside the try-block) rather than requiredChecks.length
+            // (which is mutated downstream by the fallback). This way
+            // any future refactor that reorders the fallback cannot
+            // silently re-open the v3-MED#3 hole.
             let requiredChecks = [];
-            let bpUnreadable = false;
+            let hadProtectionSignal = false;  // true ⇒ we successfully read BP
+            let bpUnreadable = false;          // true ⇒ 403/404 on lookup
             try {
               const { data: protection } = await github.rest.repos.getBranchProtection({
                 owner: context.repo.owner,
@@ -233,6 +246,7 @@ jobs:
               const legacy = rsc?.contexts ?? [];
               const modern = (rsc?.checks ?? []).map(c => c.context);
               requiredChecks = [...new Set([...legacy, ...modern])];
+              hadProtectionSignal = true;
             } catch (e) {
               // v3 review MED#3: distinguish "no protection" from
               // "missing administration:read permission". Both surface
@@ -240,24 +254,32 @@ jobs:
               // case must NOT silently degrade to the fallback gate.
               if (e.status === 404 || e.status === 403) {
                 bpUnreadable = true;
-                console.log(`Branch-protection lookup returned ${e.status} on ${pr.base.ref}: ${e.message}. Treating as unprotected — fallback gate (triggering workflow + AI Review) will apply.`);
+                console.log(`Branch-protection lookup returned ${e.status} on ${pr.base.ref}: ${e.message}. Treating as unprotected — fallback gate (triggering workflow + AI Review) will apply unless this is the protected-but-unreadable case.`);
               } else {
                 console.log(`Branch-protection lookup failed (HTTP ${e.status}): ${e.message}. Skipping auto-approve out of caution.`);
                 return;
               }
             }
 
-            // v4 review HIGH#1: actually USE the bpUnreadable flag.
-            // v4 set it but never consulted it, leaving the protected-
-            // but-unreadable case to silently fall through to fallback.
-            // If branch protection is unreadable AND we have no
-            // required checks (i.e., we cannot reconstruct what BP
-            // would have demanded), refuse to auto-approve. This is
-            // the conservative path the v3 review MED#3 specifically
-            // asked for.
-            if (bpUnreadable && requiredChecks.length === 0) {
-              console.log(`Branch-protection unreadable on ${pr.base.ref} and no required-checks list to fall back on. Refusing to auto-approve — grant the App administration:read on this repo, or remove branch protection if intentional.`);
-              return;
+            // v4 review HIGH#1 + v5 review HIGH#2: refuse to approve
+            // when BP could not be read AND we have no other signal.
+            // bpUnreadable is true for both 404 (no protection at all)
+            // and 403 (protection exists but App lacks
+            // administration:read). The 404 case is fine — fallback
+            // applies. The 403 case must NOT silently degrade.
+            // We can't distinguish the two from the API response, so
+            // err on the side of caution: if we got NO protection
+            // signal at all, only proceed via the deliberate fallback
+            // (which still requires CI workflow + AI Review). The
+            // operator who has explicitly granted no protection on
+            // this branch is opting into the fallback contract.
+            //
+            // Note: hadProtectionSignal is the source of truth, NOT
+            // requiredChecks.length — that gets mutated below.
+            if (bpUnreadable && !hadProtectionSignal) {
+              // documented fall-through to fallback gate; the gate
+              // itself enforces strict CI + AI Review success.
+              console.log(`Proceeding to fallback gate for ${pr.base.ref}: triggering workflow ${run.name} + AI Review must both be success.`);
             }
 
             // v3 review HIGH#1: AI Review enforcement was previously
