@@ -4,20 +4,43 @@ name: Auto Approve PRs
 # Uses the meshlogic-ci-dependency-access GitHub App to approve,
 # since the app is a distinct identity from the PR author.
 #
-# SECURITY: skips PRs that touch sensitive paths (workflows + policy).
-# Those changes must be approved by a human, not the bot — otherwise a
-# write-perm contributor could self-merge .github/workflows/ changes
-# (re-introducing the supply-chain risk that the SHA pin in
-# ai-review.yml exists to prevent).
+# SECURITY MODEL (v2 — addresses AI Review findings on PR #934):
+#
+#   1. Approves only the exact SHA that CI validated (HIGH#1):
+#      verifies pr.head.sha === workflow_run.head_sha. Prevents
+#      bait-and-switch where author force-pushes between CI green
+#      and auto-approve firing.
+#
+#   2. Concurrency keyed on workflow_run.id (HIGH#2): each run is
+#      unique, so attacker-controlled head_branch can't cancel a
+#      legitimate auto-approve via branch-name collision.
+#
+#   3. Author must be a public member of MeshLogic-Pty-Ltd org AND
+#      have write+ permission on the repo (MED#3 — closes
+#      outside-collaborator gap). Mirrors the canonical override
+#      gate in meshlogic-agent/.github/workflows/ai-review.yml.
+#
+#   4. Verifies ALL required status checks (per branch protection)
+#      are success on the validated SHA before approving (MED#4).
+#      If branch protection has no required checks, falls back to
+#      verifying the triggering workflow + AI Review are success.
+#
+#   5. Skips PRs touching sensitive paths (LOW#6 — extended set):
+#      CI workflows, dependabot config, CODEOWNERS, OPA policy,
+#      build-config (Cargo, package.json, go.mod, requirements.txt
+#      etc.), composite actions, scripts, and signing/secrets
+#      directories. Those changes require human approval to
+#      prevent self-merge of supply-chain-relevant config.
 on:
   workflow_run:
     workflows: ["Go SDK", "Python SDK", "TypeScript SDK"]
     types: [completed]
 
-# Only one auto-approve per PR at a time — prevents cascade pile-up
+# Each workflow_run.id is unique — prevents head_branch-collision
+# DoS while still serializing duplicate runs of the same trigger.
 concurrency:
-  group: auto-approve-${{ github.event.workflow_run.head_branch }}
-  cancel-in-progress: true
+  group: auto-approve-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
 
 jobs:
   auto-approve:
@@ -51,16 +74,24 @@ jobs:
 
             const prNumber = prs[0].number;
 
-            // Security: verify PR author is an org member (blocks fork PR attacks)
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: prNumber,
             });
 
+            // HIGH#1: approve only the exact commit CI validated.
+            // Without this, an author can push commit A → CI green →
+            // push commit B → auto-approve fires on A's success but
+            // the PR head is now B (which CI never saw).
+            if (pr.head.sha !== run.head_sha) {
+              console.log(`PR #${prNumber} head ${pr.head.sha.slice(0,7)} has advanced past validated SHA ${run.head_sha.slice(0,7)} — skipping auto-approve. A new CI run will trigger this workflow once it succeeds.`);
+              return;
+            }
+
             const author = pr.user.login;
-            // Verify author has write+ access to this repo (covers org members and collaborators).
-            // Uses repos scope (already granted) instead of org:members:read.
+
+            // MED#3 (a): write+ permission on this repo.
             try {
               const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
                 owner: context.repo.owner,
@@ -73,21 +104,54 @@ jobs:
                 return;
               }
             } catch (e) {
-              const status = e.status || 'unknown';
-              const message = e.message || 'no details';
-              console.log(`PR #${prNumber} — collaborator check failed for ${author} (HTTP ${status}: ${message}). Skipping auto-approve.`);
+              console.log(`PR #${prNumber} — collaborator check failed for ${author} (HTTP ${e.status || 'unknown'}: ${e.message || 'no details'}). Skipping auto-approve.`);
               return;
             }
 
-            // SECURITY: paginate listFiles and skip auto-approve on PRs that
-            // touch sensitive paths. Without paginate, large PRs (>30 files)
-            // would silently miss sensitive files past page 1, allowing the
-            // bot to approve workflow changes hidden in big diffs.
+            // MED#3 (b): public membership in MeshLogic-Pty-Ltd org.
+            // Closes the outside-collaborator gap: write+ alone would
+            // accept outside collaborators; org-membership ensures
+            // only MeshLogic-affiliated people are auto-approved.
+            //
+            // Uses checkPublicMembershipForUser (not Membership) since
+            // the App token doesn't have org:read scope. Members with
+            // private membership must make it public OR be approved
+            // by a human reviewer.
+            try {
+              await github.rest.orgs.checkPublicMembershipForUser({
+                org: 'MeshLogic-Pty-Ltd',
+                username: author,
+              });
+            } catch (e) {
+              console.log(`PR #${prNumber} author ${author} is not a public member of MeshLogic-Pty-Ltd (HTTP ${e.status || 'unknown'}). Make org membership public or request human approval.`);
+              return;
+            }
+
+            // LOW#6: extended sensitive-path skip. Paginated to catch
+            // sensitive files past the first 30 in large PRs.
             const SENSITIVE_PATTERNS = [
-              /^\.github\/workflows\//,         // any CI / review workflow
-              /^\.github\/dependabot\.ya?ml$/,  // dependency update config
-              /^\.github\/CODEOWNERS$/,         // review-routing rules
-              /^policy\//,                       // OPA / Rego policies
+              // CI / review / governance config
+              /^\.github\/workflows\//,
+              /^\.github\/actions\//,
+              /^\.github\/dependabot\.ya?ml$/,
+              /^\.github\/CODEOWNERS$/,
+              // Policy as code
+              /^policy\//,
+              // Dependency manifests (supply-chain vector)
+              /^Cargo\.(toml|lock)$/,
+              /^package(-lock)?\.json$/,
+              /^yarn\.lock$/,
+              /^pnpm-lock\.yaml$/,
+              /^go\.(mod|sum)$/,
+              /^(requirements[^/]*\.txt|Pipfile(\.lock)?|pyproject\.toml|poetry\.lock|uv\.lock)$/,
+              /^Gemfile(\.lock)?$/,
+              /^composer\.(json|lock)$/,
+              // Build / release scripts
+              /^scripts\//,
+              /^Makefile$/,
+              // Signing material / secrets config
+              /(^|\/)(signing|certs?|secrets?|keys?)\//,
+              /\.(pem|key|p12|pfx|cer|crt)$/,
             ];
 
             const files = await github.paginate(github.rest.pulls.listFiles, {
@@ -105,13 +169,91 @@ jobs:
               const sample = sensitiveFiles.slice(0, 5).join(', ');
               const more = sensitiveFiles.length > 5 ? ` (+${sensitiveFiles.length - 5} more)` : '';
               console.log(`PR #${prNumber} touches sensitive paths — skipping auto-approve. Files: ${sample}${more}`);
-              console.log('Sensitive-path changes require explicit human approval to prevent self-merge of CI / policy / review-routing config.');
+              console.log('Sensitive-path changes require explicit human approval to prevent self-merge of supply-chain-relevant config.');
               return;
             }
 
-            console.log(`Approving PR #${prNumber} by org member ${author} after successful CI`);
+            // MED#4: verify ALL required status checks are success on
+            // the validated SHA. Without this, auto-approve fires on
+            // first-success of the triggering workflow even if other
+            // required checks are still pending or failing — creating
+            // a misleading approval signal (branch protection still
+            // blocks merge, but the bot has weighed in prematurely).
+            let requiredChecks = [];
+            try {
+              const { data: protection } = await github.rest.repos.getBranchProtection({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: pr.base.ref,
+              });
+              requiredChecks = (protection.required_status_checks?.contexts) || [];
+            } catch (e) {
+              // 404 = no branch protection on base; proceed with implicit gate
+              if (e.status !== 404) {
+                console.log(`Branch-protection lookup failed (HTTP ${e.status}): ${e.message}. Skipping auto-approve out of caution.`);
+                return;
+              }
+            }
 
-            // Check if already approved by this specific bot
+            // Fallback gate: if no required checks configured, at
+            // minimum the triggering workflow must be success and
+            // (if installed) the AI Review status must be success.
+            // This protects repos like MeshLogic-Kernel that have no
+            // branch protection yet.
+            if (requiredChecks.length === 0) {
+              requiredChecks = [run.name];
+              const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: run.head_sha,
+              });
+              const aiReview = combined.statuses.find(s => s.context === 'AI Review Findings');
+              if (aiReview) requiredChecks.push('AI Review Findings');
+            }
+
+            // Fetch all check-runs + statuses on the validated SHA.
+            const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: run.head_sha,
+              per_page: 100,
+            });
+            const { data: combinedStatus } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: run.head_sha,
+            });
+
+            const checkOutcomes = new Map();
+            for (const cr of checkRuns) {
+              // success | failure | neutral | cancelled | skipped | timed_out | action_required | stale
+              checkOutcomes.set(cr.name, cr.conclusion);
+            }
+            for (const s of combinedStatus.statuses) {
+              checkOutcomes.set(s.context, s.state); // success | failure | error | pending
+            }
+
+            const failing = [];
+            const missing = [];
+            for (const required of requiredChecks) {
+              const outcome = checkOutcomes.get(required);
+              if (outcome === undefined) {
+                missing.push(required);
+              } else if (!['success', 'neutral', 'skipped'].includes(outcome)) {
+                failing.push(`${required}=${outcome}`);
+              }
+            }
+
+            if (missing.length > 0 || failing.length > 0) {
+              if (missing.length > 0) console.log(`Required checks not yet reported on ${run.head_sha.slice(0,7)}: ${missing.join(', ')}`);
+              if (failing.length > 0) console.log(`Required checks not green on ${run.head_sha.slice(0,7)}: ${failing.join(', ')}`);
+              console.log('Skipping auto-approve until all required checks pass on the validated SHA.');
+              return;
+            }
+
+            console.log(`Approving PR #${prNumber} by org member ${author} after all required checks green on ${run.head_sha.slice(0,7)}`);
+
+            // Idempotency: don't double-approve.
             const { data: reviews } = await github.rest.pulls.listReviews({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -120,11 +262,12 @@ jobs:
 
             const appApproval = reviews.find(
               r => r.state === 'APPROVED' &&
-                   r.user.login === 'meshlogic-ci-dependency-access[bot]'
+                   r.user.login === 'meshlogic-ci-dependency-access[bot]' &&
+                   r.commit_id === run.head_sha
             );
 
             if (appApproval) {
-              console.log('PR already approved by meshlogic-ci-dependency-access — skipping');
+              console.log(`PR #${prNumber} already approved by meshlogic-ci-dependency-access for SHA ${run.head_sha.slice(0,7)} — skipping`);
               return;
             }
 
@@ -132,8 +275,9 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: prNumber,
+              commit_id: run.head_sha,
               event: 'APPROVE',
-              body: 'All CI checks passed. Auto-approved by meshlogic-ci-dependency-access.',
+              body: `All required CI checks passed on ${run.head_sha.slice(0,7)}. Auto-approved by meshlogic-ci-dependency-access.`,
             });
 
-            console.log(`PR #${prNumber} approved`);
+            console.log(`PR #${prNumber} approved at SHA ${run.head_sha.slice(0,7)}`);
