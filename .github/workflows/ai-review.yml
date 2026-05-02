@@ -1,0 +1,60 @@
+name: AI Review
+
+# Calls the reusable AI review workflow hosted in
+# MeshLogic-Pty-Ltd/meshlogic-agent at the @v1 tag (NOT @main).
+# See https://github.com/MeshLogic-Pty-Ltd/meshlogic-agent/blob/main/docs/AI-REVIEW.md
+#
+# Requirements:
+# - meshlogic-ci-dependency-access GitHub App installed on this repo
+#   (Org settings → Installed GitHub Apps → Configure → add this repo).
+# - Org-level secrets APP_ID + APP_PRIVATE_KEY visible to this repo
+#   (set at the org level with --visibility all).
+# - Org-level secret ANTHROPIC_API_KEY (sourced from AWS Secrets Manager
+#   meshlogic/anthropic-api-key).
+#
+# Severity gating (controlled by the reusable workflow):
+# - BLOCKING / HIGH  → AI Review Findings status check fails
+# - MEDIUM / LOW / NIT → status check passes, comments are advisory
+#
+# Override (admin only):
+# - Comment `/ai-review override <reason>` (write+ permission required).
+
+permissions: {}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+jobs:
+  ai-review:
+    # SECURITY: Caller-level actor gate.
+    # `secrets: inherit` (below) makes APP_PRIVATE_KEY + ANTHROPIC_API_KEY
+    # available to the workflow context as soon as the job is invoked.
+    # The called workflow has its own two-factor override gate, but it
+    # runs AFTER secrets are inherited. Filtering at the caller means
+    # issue_comment events from non-org actors don't invoke the called
+    # workflow at all — secrets never enter scope.
+    # The pull_request path is unrestricted (any contributor's PR is
+    # reviewed); the issue_comment override path is gated to org members
+    # / collaborators / repo owner.
+    if: |
+      github.event_name == 'pull_request' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        startsWith(github.event.comment.body, '/ai-review override') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    # SHA-pinned to v1 tag commit (was f0549a3 at 2026-05-01).
+    # Update via: `gh api repos/MeshLogic-Pty-Ltd/meshlogic-agent/git/refs/tags/v1 --jq '.object.sha'`
+    # Why SHA not tag: this workflow gets `secrets: inherit` (APP_PRIVATE_KEY + ANTHROPIC_API_KEY).
+    # Mutable @v1 = supply-chain risk if the tag is repointed. SHA = immutable.
+    uses: MeshLogic-Pty-Ltd/meshlogic-agent/.github/workflows/ai-review.yml@f0549a36936809a6320ad438d79a3a4d33092457
+    secrets: inherit
+    permissions:
+      pull-requests: write
+      contents: read
+      statuses: write
+      issues: read
