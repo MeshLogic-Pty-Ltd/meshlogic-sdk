@@ -11,7 +11,7 @@ name: Auto Approve PRs
 # auto-approve will silently stop firing. Keep this list in sync
 # with branch protection's required-checks list.
 #
-# SECURITY MODEL (v4 — incorporates AI Review findings on #934, #937, and v3 of consumer rollout):
+# SECURITY MODEL (v5 — addresses HIGH bpUnreadable bug in v4 plus tightening of signing-path regex, concurrency key, and helper-function shape):
 #
 #   1. Approves only the exact SHA that CI validated (HIGH#1):
 #      verifies pr.head.sha === workflow_run.head_sha. Prevents
@@ -43,10 +43,14 @@ on:
     workflows: ["Go SDK", "Python SDK", "TypeScript SDK"]
     types: [completed]
 
-# Each workflow_run.id is unique — prevents head_branch-collision
-# DoS while still serializing duplicate runs of the same trigger.
+# v4 review MED#2: serialize on workflow_run.head_sha — that's the
+# attacker-uncontrolled commit identifier (set by GitHub from the
+# actual ref). Keying on workflow_run.id was effectively a no-op
+# since each id is unique; head_sha lets us correctly serialize
+# rapid CI re-runs against the same commit. Idempotency is also
+# enforced at the createReview step (commit_id match).
 concurrency:
-  group: auto-approve-${{ github.event.workflow_run.id }}
+  group: auto-approve-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -74,11 +78,12 @@ jobs:
             const run = context.payload.workflow_run;
             const prs = run.pull_requests;
 
-            // v2 LOW#1 + v3 MED#5: helper declared as const arrow
-            // before the call site, with `run` passed explicitly.
-            // Function declarations would hoist but the resulting
-            // dependency on enclosing-scope state is fragile under
-            // changes to the actions/github-script wrapper.
+            // v2 LOW#1 + v3 MED#5 + v4 LOW#1: helper declared as a
+            // const arrow before the call site. Closes over `run`,
+            // `github`, `context`, `core` from the enclosing scope
+            // (consistent with how actions/github-script users
+            // normally reference these — passing them as parameters
+            // would be inconsistent with `github`/`context` access).
             //
             // v3 review note on forks: workflow_run.pull_requests is
             // ONLY populated for same-repo PRs by design. The job-
@@ -87,7 +92,7 @@ jobs:
             // this code; that's intentional — forks must always go
             // through human review. This is documented to prevent
             // a future maintainer from "fixing" the silent skip.
-            const processPullRequest = async (prNumber, run) => {
+            const processPullRequest = async (prNumber) => {
 
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -174,9 +179,16 @@ jobs:
               // Build / release scripts
               /^scripts\//,
               /^Makefile$/,
-              // Signing material / secrets config
-              /(^|\/)(signing|certs?|secrets?|keys?)(\/|\.)/,
-              /\.(pem|key|p12|pfx|cer|crt)$/,
+              // Signing material / secrets directories
+              // v4 review MED#1: tightened from the over-broad
+              // /(^|\/)(signing|certs?|secrets?|keys?)(\/|\.)/ which
+              // matched legitimate code paths like `secrets.json` (a
+              // dependency-lock-style file in some repos) or any
+              // `keys.txt`. Restrict to known top-level directory
+              // names; rely on the file-extension list below for
+              // catching loose secret files anywhere in the tree.
+              /^(\.github\/)?(signing|secrets|keys|certs)\//i,
+              /\.(pem|key|p12|pfx|cer|crt|asc|gpg)$/i,
             ];
 
             const files = await github.paginate(github.rest.pulls.listFiles, {
@@ -235,6 +247,19 @@ jobs:
               }
             }
 
+            // v4 review HIGH#1: actually USE the bpUnreadable flag.
+            // v4 set it but never consulted it, leaving the protected-
+            // but-unreadable case to silently fall through to fallback.
+            // If branch protection is unreadable AND we have no
+            // required checks (i.e., we cannot reconstruct what BP
+            // would have demanded), refuse to auto-approve. This is
+            // the conservative path the v3 review MED#3 specifically
+            // asked for.
+            if (bpUnreadable && requiredChecks.length === 0) {
+              console.log(`Branch-protection unreadable on ${pr.base.ref} and no required-checks list to fall back on. Refusing to auto-approve — grant the App administration:read on this repo, or remove branch protection if intentional.`);
+              return;
+            }
+
             // v3 review HIGH#1: AI Review enforcement was previously
             // only added in the fallback (no-branch-protection) path.
             // For repos that DO have branch protection but don't list
@@ -244,10 +269,18 @@ jobs:
             // it unconditionally. If a repo legitimately doesn't have
             // AI Review installed, this gate fails closed (the check
             // is "missing" → auto-approve skips → human review needed).
+            //
+            // v4 review HIGH#2 (partial): the literal name 'AI Review
+            // Findings' is hardcoded. The reusable workflow posts
+            // both a check-run AND a legacy commit status under this
+            // name (see meshlogic-agent/.github/workflows/ai-review
+            // .yml). If the upstream reusable workflow renames it,
+            // this constant must be updated in lockstep.
+            const AI_REVIEW_CHECK_NAME = 'AI Review Findings';
             if (requiredChecks.length === 0) {
               requiredChecks = [run.name];
             }
-            requiredChecks = [...new Set([...requiredChecks, 'AI Review Findings'])];
+            requiredChecks = [...new Set([...requiredChecks, AI_REVIEW_CHECK_NAME])];
 
             // Fetch all check-runs + statuses on the validated SHA.
             const checkRuns = await github.paginate(github.rest.checks.listForRef, {
@@ -341,7 +374,7 @@ jobs:
 
             for (const prRef of prs) {
               try {
-                await processPullRequest(prRef.number, run);
+                await processPullRequest(prRef.number);
               } catch (e) {
                 console.log(`PR #${prRef.number}: unexpected error during auto-approve evaluation — ${e.message}. Skipping.`);
               }
