@@ -4,7 +4,14 @@ name: Auto Approve PRs
 # Uses the meshlogic-ci-dependency-access GitHub App to approve,
 # since the app is a distinct identity from the PR author.
 #
-# SECURITY MODEL (v2 — addresses AI Review findings on PR #934):
+# MAINTENANCE NOTE: the on.workflow_run.workflows array below uses
+# the human-readable `name:` of each gating workflow (GitHub does
+# not support file-path or ID matching here). If you rename a
+# gating workflow, this trigger must be updated in the same PR or
+# auto-approve will silently stop firing. Keep this list in sync
+# with branch protection's required-checks list.
+#
+# SECURITY MODEL (v3 — incorporates AI Review findings on #934 + #937):
 #
 #   1. Approves only the exact SHA that CI validated (HIGH#1):
 #      verifies pr.head.sha === workflow_run.head_sha. Prevents
@@ -72,7 +79,21 @@ jobs:
               return;
             }
 
-            const prNumber = prs[0].number;
+            // v2 review LOW#1: iterate over every PR rather than
+            // unconditionally indexing prs[0]. In practice
+            // workflow_run.pull_requests is almost always length 1
+            // (and only populated for same-repo PRs), but a commit
+            // attached to multiple PRs would otherwise be silently
+            // half-approved.
+            for (const prRef of prs) {
+              try {
+                await processPullRequest(prRef.number);
+              } catch (e) {
+                console.log(`PR #${prRef.number}: unexpected error during auto-approve evaluation — ${e.message}. Skipping.`);
+              }
+            }
+
+            async function processPullRequest(prNumber) {
 
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -179,6 +200,11 @@ jobs:
             // required checks are still pending or failing — creating
             // a misleading approval signal (branch protection still
             // blocks merge, but the bot has weighed in prematurely).
+            //
+            // Reads BOTH the legacy `contexts` field AND the newer
+            // ruleset/branch-protection-v2 `checks[].context` field
+            // (v2 review MED#3): a repo migrated to rulesets may have
+            // an empty contexts list and only populate checks[].
             let requiredChecks = [];
             try {
               const { data: protection } = await github.rest.repos.getBranchProtection({
@@ -186,29 +212,31 @@ jobs:
                 repo: context.repo.repo,
                 branch: pr.base.ref,
               });
-              requiredChecks = (protection.required_status_checks?.contexts) || [];
+              const rsc = protection.required_status_checks;
+              const legacy = rsc?.contexts ?? [];
+              const modern = (rsc?.checks ?? []).map(c => c.context);
+              requiredChecks = [...new Set([...legacy, ...modern])];
             } catch (e) {
-              // 404 = no branch protection on base; proceed with implicit gate
+              // 404 = no branch protection on base; proceed with fallback gate
               if (e.status !== 404) {
                 console.log(`Branch-protection lookup failed (HTTP ${e.status}): ${e.message}. Skipping auto-approve out of caution.`);
                 return;
               }
             }
 
-            // Fallback gate: if no required checks configured, at
-            // minimum the triggering workflow must be success and
-            // (if installed) the AI Review status must be success.
-            // This protects repos like MeshLogic-Kernel that have no
-            // branch protection yet.
+            // Fallback gate: if no required checks configured, the
+            // triggering workflow AND AI Review Findings must both be
+            // success. v2 review HIGH#1: AI Review is posted as a
+            // *check-run* (not a legacy commit status), so looking it
+            // up in combined.statuses returned nothing and the check
+            // was silently dropped — letting auto-approve fire while
+            // AI Review was pending or had flagged BLOCKING/HIGH.
+            // We now ALWAYS require AI Review in fallback mode and
+            // resolve it later from the merged check-runs+statuses
+            // map. Repos that genuinely don't have AI Review installed
+            // will fail closed (no auto-approve) rather than fail open.
             if (requiredChecks.length === 0) {
-              requiredChecks = [run.name];
-              const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: run.head_sha,
-              });
-              const aiReview = combined.statuses.find(s => s.context === 'AI Review Findings');
-              if (aiReview) requiredChecks.push('AI Review Findings');
+              requiredChecks = [run.name, 'AI Review Findings'];
             }
 
             // Fetch all check-runs + statuses on the validated SHA.
@@ -233,13 +261,21 @@ jobs:
               checkOutcomes.set(s.context, s.state); // success | failure | error | pending
             }
 
+            // v2 review LOW#2: drop 'skipped' from the accepted set.
+            // GitHub treats skipped as not-passing for required
+            // checks; an attacker who can cause a required check to
+            // be skipped (e.g. via path filters) shouldn't get a free
+            // auto-approve. 'neutral' is retained because GitHub's
+            // own branch-protection semantics treat it as passing for
+            // check-runs that opt into it.
+            const PASSING = new Set(['success', 'neutral']);
             const failing = [];
             const missing = [];
             for (const required of requiredChecks) {
               const outcome = checkOutcomes.get(required);
-              if (outcome === undefined) {
+              if (outcome === undefined || outcome === null) {
                 missing.push(required);
-              } else if (!['success', 'neutral', 'skipped'].includes(outcome)) {
+              } else if (!PASSING.has(outcome)) {
                 failing.push(`${required}=${outcome}`);
               }
             }
@@ -281,3 +317,5 @@ jobs:
             });
 
             console.log(`PR #${prNumber} approved at SHA ${run.head_sha.slice(0,7)}`);
+
+            }  // end processPullRequest
